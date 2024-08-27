@@ -185,7 +185,7 @@ class BingxsGateway(BaseGateway):
     # ----------------------------------------------------------------------------------------------------
     def query_order(self) -> None:
         """
-        查询未成交委托
+        查询活动委托单
         """
         self.rest_api.query_order()
     # ----------------------------------------------------------------------------------------------------
@@ -294,7 +294,7 @@ class BingxsRestApi(RestClient):
         self.accounts_info: Dict[str, dict] = {}
         # websocket令牌
         self.listen_key = ""
-        # 用户自定义orderid与系统orderid映射
+        # 用户自定义orderid与交易所orderid映射
         self.orderid_systemid_map: Dict[str, str] = defaultdict(str)
         self.systemid_orderid_map: Dict[str, str] = defaultdict(str)
         # 成交委托单
@@ -305,31 +305,26 @@ class BingxsRestApi(RestClient):
         生成BINGX签名
         """
         # 获取鉴权类型并将其从data中删除
-        security = request.data["security"]
-        request.data.pop("security")
+        security = request.data.pop("security", None)
         if security == Security.NONE:
             request.data = None
             return request
 
-        method = request.method
-        params = request.params
-        uri_path = request.path
-        request_data = request.data
-        if params:
-            sorted_data = params
-        elif request_data:
-            sorted_data = request_data
-        else:
-            sorted_data = {}
-        sorted_data["timestamp"] = int(time() * 1000)
-        sorted_data["recvWindow"] = 5000
-        sorted_keys = sorted(sorted_data)
-        params_str = "&".join(["{}={}".format(x, sorted_data[x]) for x in sorted_keys])
-        request.path = uri_path + "?" + params_str + f"&signature={get_sign(self.secret, params_str)}"
-        request.data = request.params = {}
-        if not request.headers:
-            request.headers = {}
-            request.headers["X-BX-APIKEY"] = self.key
+        sorted_data = request.params or request.data or {}
+        sorted_data.update({
+            "timestamp": int(time() * 1000),
+            "recvWindow": 5000
+        })
+
+        params_str = "&".join(f"{k}={sorted_data[k]}" for k in sorted(sorted_data))
+        signature = get_sign(self.secret, params_str)
+        request.path = f"{request.path}?{params_str}&signature={signature}"
+        
+        request.data = {}
+        request.params = {}
+        request.headers = request.headers or {}
+        request.headers["X-BX-APIKEY"] = self.key
+
         return request
     # ----------------------------------------------------------------------------------------------------
     def connect(
@@ -344,7 +339,7 @@ class BingxsRestApi(RestClient):
         """
         self.key = key
         self.secret = secret.encode()
-        self.connect_time = int(datetime.now().strftime("%y%m%d%H%M%S"))
+        self.connect_time = int(datetime.now().strftime("%Y%m%d%H%M%S"))
         self.init(REST_HOST, proxy_host, proxy_port, gateway_name=self.gateway_name)
         self.start()
         self.gateway.write_log(f"交易接口：{self.gateway_name}，REST API启动成功")
@@ -437,7 +432,7 @@ class BingxsRestApi(RestClient):
         查询24小时tick变动
         """
         data: dict = {
-            "security": Security.SIGNED,
+            "security": Security.NONE,
         }
         params = {"symbol": symbol}
         path: str = "/openApi/swap/v2/quote/ticker"
@@ -483,7 +478,7 @@ class BingxsRestApi(RestClient):
     # ----------------------------------------------------------------------------------------------------
     def query_order(self) -> None:
         """
-        查询未成交委托
+        查询活动委托单
         """
         data: dict = {"security": Security.SIGNED}
         path: str = "/openApi/swap/v2/trade/openOrders"
@@ -1026,6 +1021,7 @@ class BingxsWebsocketApi(WebsocketClient):
         system_id = data["i"]
         systemid_orderid_map = self.gateway.rest_api.systemid_orderid_map
         order_id = systemid_orderid_map[system_id]
+        # 获取不到用户委托单id用交易所委托单id撤单
         if not order_id:
             self.gateway.rest_api.cancel_order(
                 req= CancelRequest(
