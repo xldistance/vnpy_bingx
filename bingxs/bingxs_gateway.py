@@ -439,6 +439,9 @@ class BingxsRestApi(RestClient):
         self.add_request(method="GET", path=path, callback=self.on_tick, data=data, params=params)
     # ----------------------------------------------------------------------------------------------------
     def on_tick(self, data: dict, request: Request) -> None:
+        """
+        收到tick的日开盘价，最高价，最低价，成交量数据
+        """
         data = data["data"]
         symbol = data["symbol"]
 
@@ -930,7 +933,7 @@ class BingxsWebsocketApi(WebsocketClient):
 
         self.subscribed[req.symbol] = req
         # 公共和私有主题
-        public_topics = [f"{req.symbol}@depth5", f"{req.symbol}@trade"]
+        public_topics = [f"{req.symbol}@depth5@100ms", f"{req.symbol}@trade"]
         private_topics = ["ORDER_TRADE_UPDATE", "ACCOUNT_UPDATE"]
 
         # 订阅公共主题
