@@ -86,18 +86,14 @@ OPPOSITE_DIRECTION = {
     Direction.LONG: Direction.SHORT,
     Direction.SHORT: Direction.LONG,
 }
-
-
 # 鉴权类型
 class Security(Enum):
     NONE: int = 0
     SIGNED: int = 1
-
-
 # ----------------------------------------------------------------------------------------------------
 class BingxsGateway(BaseGateway):
     """
-    vn.py用于对接bingx usdt永续的交易接口
+    vn.py用于对接bingx usdt,usdc永续的交易接口
     """
 
     default_setting: Dict[str, Any] = {
@@ -107,7 +103,7 @@ class BingxsGateway(BaseGateway):
         "port": 0,
     }
 
-    exchanges: Exchange = [Exchange.BINGXS]
+    exchanges: List[Exchange] = [Exchange.BINGXS]
     # ----------------------------------------------------------------------------------------------------
     def __init__(self, event_engine: EventEngine, gateway_name: str = "BINGXS") -> None:
         """
@@ -120,7 +116,7 @@ class BingxsGateway(BaseGateway):
         self.orders: Dict[str, OrderData] = {}
         # 所有合约列表
         self.recording_list = GetFilePath.recording_list
-        self.recording_list = [vt_symbol for vt_symbol in self.recording_list if is_target_contract(vt_symbol, self.gateway_name)]
+        self.recording_list = [vt_symbol for vt_symbol in self.recording_list if is_target_contract(vt_symbol, self.gateway_name) and extract_vt_symbol(vt_symbol)[0].endswith(("USDT", "USDC"))]
         # 查询历史数据合约列表
         self.history_contracts = copy(self.recording_list)
         # 查询行情合约列表
@@ -218,32 +214,22 @@ class BingxsGateway(BaseGateway):
             )
             self.rest_api.query_history(req)
             self.rest_api.set_leverage(symbol)
+            self.rest_api.set_margin_type(symbol)
     # ----------------------------------------------------------------------------------------------------
     def process_timer_event(self, event) -> None:
         """
         处理定时事件
         """
-        # 一次查询30个tick行情
-        query_contracts = self.query_contracts[:30]
-        remain_contracts = self.query_contracts[30:]
-        for vt_symbol in query_contracts:
-            symbol, *_ = extract_vt_symbol(vt_symbol)
-            self.rest_api.query_tick(symbol)
-        remain_contracts.extend(query_contracts)
-        self.query_contracts = remain_contracts
+        # 一次查询1个tick行情
+        vt_symbol = self.query_contracts.pop(0)
+        symbol, *_ = extract_vt_symbol(vt_symbol)
+        self.rest_api.query_tick(symbol)
+        self.query_contracts.append(vt_symbol)
+
 
         function = self.query_functions.pop(0)
         function()
         self.query_functions.append(function)
-        # 从委托单映射字典中删除非活动委托单用户id和交易所id
-        orderids = list(self.rest_api.orderid_systemid_map)
-        if len(orderids) > 50:
-            orderid = orderids[0]
-            order = self.get_order(orderid)
-            if not order or order.status not in ACTIVE_STATUSES:
-                systemid = self.rest_api.orderid_systemid_map.pop(orderid)
-                if systemid in self.rest_api.systemid_orderid_map:
-                    self.rest_api.systemid_orderid_map.pop(systemid)
 
         # 每隔30分钟发送一次延长listenkey请求
         self.count += 1
@@ -294,9 +280,6 @@ class BingxsRestApi(RestClient):
         self.accounts_info: Dict[str, dict] = {}
         # websocket令牌
         self.listen_key = ""
-        # 用户自定义orderid与交易所orderid映射
-        self.orderid_systemid_map: Dict[str, str] = defaultdict(str)
-        self.systemid_orderid_map: Dict[str, str] = defaultdict(str)
         # 成交委托单
         self.trade_id = 0
     # ----------------------------------------------------------------------------------------------------
@@ -387,6 +370,26 @@ class BingxsRestApi(RestClient):
     def on_positionside(self,data: dict, request: dict):
         pass
     # ----------------------------------------------------------------------------------------------------
+    def set_margin_type(self,symbol:str):
+        """
+        设置全仓持仓模式
+        """
+        path = "/openApi/swap/v2/trade/marginType"
+        data: dict = {
+            "security": Security.SIGNED,
+            "symbol": symbol,
+            "marginType": "CROSSED",
+        }
+        self.add_request(
+            method="POST",
+            path=path,
+            callback=self.on_margin_type,
+            data=data,
+        )
+    # ----------------------------------------------------------------------------------------------------
+    def on_margin_type(self, data: dict, request: dict):
+        pass
+    # ----------------------------------------------------------------------------------------------------
     def get_listen_key(self):
         """
         获取websocket私有令牌
@@ -442,8 +445,8 @@ class BingxsRestApi(RestClient):
         """
         收到tick的日开盘价，最高价，最低价，成交量数据
         """
-        data = data["data"]
-        symbol = data["symbol"]
+        raw = data["data"]
+        symbol = raw["symbol"]
 
         tick = self.usdt_ws_api.ticks.get(symbol, None)
             
@@ -453,10 +456,10 @@ class BingxsRestApi(RestClient):
                 exchange=Exchange.BINGXS,
                 gateway_name=self.gateway_name,
             )
-        tick.open_price = float(data["openPrice"])
-        tick.high_price = float(data["highPrice"])
-        tick.low_price = float(data["lowPrice"])
-        tick.volume = float(data["volume"])
+        tick.open_price = float(raw["openPrice"])
+        tick.high_price = float(raw["highPrice"])
+        tick.low_price = float(raw["lowPrice"])
+        tick.volume = float(raw["volume"])
     # ----------------------------------------------------------------------------------------------------
     def query_account(self) -> None:
         """
@@ -499,54 +502,49 @@ class BingxsRestApi(RestClient):
         """
         self.add_request(method="GET", path="/openApi/swap/v2/quote/contracts", callback=self.on_query_contract, data={"security": Security.NONE})
     # ----------------------------------------------------------------------------------------------------
-    def get_traded(self, symbol: str, system_id: str):
+    def get_order_detail(self,symbol:str,orderid:str | int):
         """
-        通过系统委托单号查询委托单
+        获取订单详情
         """
-        data: dict = {
-            "security": Security.SIGNED,
+        path = "/openApi/cswap/v1/trade/orderDetail"
+        data: dict = {"security": Security.SIGNED}
+        params = {
+            "symbol":symbol,
         }
-        params = {"symbol": symbol, "orderId": int(system_id)}
-        path: str = "/openApi/swap/v2/trade/order"
-
+        if isinstance(orderid,int):
+            params["orderId"] = orderid
+        else:
+            params["clientOrderId"] = orderid
         self.add_request(
             method="GET",
             path=path,
-            callback=self.on_traded,
+            callback=self.on_order_detail,
             data=data,
             params=params,
         )
     # ----------------------------------------------------------------------------------------------------
-    def on_traded(self, data: dict, request: Request) -> None:
+    def on_order_detail(self, data: dict, request: Request) -> None:
         """
         收到委托单推送
         """
-        data = data["data"]["order"]
-        system_id = data["orderId"]
-        order_id = self.systemid_orderid_map[data["orderId"]]
-        direction, offset = DIRECTION_OFFSET_BINGX2VT[(data["positionSide"], data["side"])]
+        raw = data["data"]["order"]
+
+        direction, offset = DIRECTION_OFFSET_BINGX2VT[(raw["positionSide"], raw["side"])]
         order: OrderData = OrderData(
-            orderid=order_id,
-            symbol=data["symbol"],
+            orderid=raw["clientOrderId"] if raw["clientOrderId"] else raw["orderId"],
+            symbol=raw["symbol"],
             exchange=Exchange.BINGXS,
-            price=float(data["price"]),
-            volume=float(data["origQty"]),
-            traded=float(data["executedQty"]),
+            price=float(raw["price"]),
+            volume=float(raw["origQty"]),
+            type=ORDERTYPE_BINGX2VT[raw["type"]],
             direction=direction,
             offset=offset,
-            type=ORDERTYPE_BINGX2VT[data["type"]],
-            status=STATUS_BINGX2VT[data["status"]],
-            datetime=get_local_datetime(data["time"]),
+            traded=float(raw["executedQty"]),
+            status=STATUS_BINGX2VT[raw["status"]],
+            datetime=get_local_datetime(raw["time"]),
             gateway_name=self.gateway_name,
         )
-
         self.gateway.on_order(order)
-        if order.status not in ACTIVE_STATUSES:
-            if order_id in self.orderid_systemid_map:
-                self.orderid_systemid_map.pop(order_id)
-            if system_id in self.systemid_orderid_map:
-                self.systemid_orderid_map.pop(system_id)
-
         if order.traded:
             self.trade_id += 1
             trade: TradeData = TradeData(
@@ -554,11 +552,11 @@ class BingxsRestApi(RestClient):
                 exchange=Exchange.BINGXS,
                 orderid=order.orderid,
                 tradeid=self.trade_id,
-                direction=order.direction,
-                offset=order.offset,
+                direction=direction,
+                offset=offset,
                 price=order.price,
                 volume=order.traded,
-                datetime=get_local_datetime(data["time"]),
+                datetime=get_local_datetime(raw["time"]),
                 gateway_name=self.gateway_name,
             )
             self.gateway.on_trade(trade)
@@ -576,7 +574,7 @@ class BingxsRestApi(RestClient):
         委托下单
         """
         # 生成本地委托号
-        orderid: str = req.symbol + "-" + str(self.connect_time + self._new_order_id())
+        orderid: str = req.symbol.lower() + "-" + str(self.connect_time) + str(self._new_order_id()).rjust(8,"0")
 
         # 推送提交中事件
         order: OrderData = req.create_order_data(orderid, self.gateway_name)
@@ -587,10 +585,13 @@ class BingxsRestApi(RestClient):
             "symbol": req.symbol,
             "side": offset,
             "positionSide": direction,
+            "clientOrderId": orderid,
+            "timeInForce": "GTC",
             "price": float(req.price),
             "quantity": float(req.volume),
             "type": ORDERTYPE_VT2BINGX[req.type],
         }
+
         self.add_request(
             method="POST",
             path="/openApi/swap/v2/trade/order",
@@ -605,17 +606,16 @@ class BingxsRestApi(RestClient):
     def cancel_order(self, req: CancelRequest) -> None:
         """
         委托撤单
-        必须用api生成的订单编号撤单
         """
-        systemid = self.orderid_systemid_map[req.orderid]
-        if not systemid:
-            systemid = req.orderid
         data: dict = {
             "security": Security.SIGNED,
             "symbol": req.symbol,
-            "orderId": systemid,
         }
-        path: str = "/openApi/swap/v2/trade/order"
+        if isinstance(req.orderid,int):
+            data["orderId"] = req.orderid
+        else:
+            data["clientOrderId"] = req.orderid
+        path = "/openApi/swap/v2/trade/order"
         order: OrderData = self.gateway.get_order(req.orderid)
         self.add_request(method="DELETE", path=path, callback=self.on_cancel_order, data=data, on_failed=self.on_cancel_failed, extra=order)
     # ----------------------------------------------------------------------------------------------------
@@ -680,35 +680,17 @@ class BingxsRestApi(RestClient):
         活动委托查询回报
         """
         for raw in data["data"]["orders"]:
-            volume = float(raw["origQty"])
-            traded = float(raw["executedQty"])
-            order_id = self.systemid_orderid_map[raw["orderId"]]
-            #rest api可能把非活动委托单识别为活动委托单，需要调用ws的委托单数据过滤
-            old_order = self.gateway.get_order(order_id)
-            if old_order and old_order.status not in ACTIVE_STATUSES:
-                continue
-            # 获取不到用户id，使用交易所id撤销该委托单
-            if not order_id:
-                self.cancel_order(
-                    req = CancelRequest(
-                        gateway_name = self.gateway_name,
-                        orderid = raw["orderId"],
-                        symbol = raw["symbol"],
-                        exchange=Exchange.BINGXS
-                    )
-                )
-                continue
             direction, offset = DIRECTION_OFFSET_BINGX2VT[(raw["positionSide"], raw["side"])]
             order: OrderData = OrderData(
-                orderid=order_id,
+                orderid=raw["clientOrderId"] if raw["clientOrderId"] else raw["orderId"],
                 symbol=raw["symbol"],
                 exchange=Exchange.BINGXS,
                 price=float(raw["price"]),
-                volume=volume,
+                volume=float(raw["origQty"]),
                 type=ORDERTYPE_BINGX2VT[raw["type"]],
                 direction=direction,
                 offset=offset,
-                traded=traded,
+                traded=float(raw["executedQty"]),
                 status=STATUS_BINGX2VT[raw["status"]],
                 datetime=get_local_datetime(raw["time"]),
                 gateway_name=self.gateway_name,
@@ -738,14 +720,12 @@ class BingxsRestApi(RestClient):
         """
         委托下单回报
         """
-        if not data["data"]:
+        if "code" in data and data["code"]:
+            order:OrderData = request.extra
+            order.status = Status.REJECTED
+            self.gateway.on_order(order)
             msg = data["msg"]
-            self.gateway.write_log(f"交易接口，发送委托单出错，错误信息：{msg}")
-            return
-        order = request.extra
-        system_id = data["data"]["order"]["orderId"]
-        self.orderid_systemid_map[order.orderid] = system_id
-        self.systemid_orderid_map[system_id] = order.orderid
+            self.gateway.write_log(f"合约：{order.vt_symbol}，发送委托单出错，错误代码{data['code']}，错误信息：{msg}")
     # ----------------------------------------------------------------------------------------------------
     def on_send_order_error(self, exception_type: type, exception_value: Exception, tb, request: Request) -> None:
         """
@@ -1019,26 +999,15 @@ class BingxsWebsocketApi(WebsocketClient):
         * 收到委托事件回报
         """
         data = packet["o"]
-        # 用户委托单ID和系统委托单ID映射
-        # order_id = data["c"]        # 交易所暂时没有用户自定义委托单id推送
-        system_id = data["i"]
-        systemid_orderid_map = self.gateway.rest_api.systemid_orderid_map
-        order_id = systemid_orderid_map[system_id]
-        # 获取不到用户委托单id用交易所委托单id撤单
-        if not order_id:
-            self.gateway.rest_api.cancel_order(
-                req= CancelRequest(
-                    gateway_name = self.gateway_name,
-                    orderid = system_id,
-                    symbol  = data["s"],
-                    exchange = Exchange.BINGXS
-                )
-            )
+        symbol = data["s"]
+        if not symbol:
             return
+        orderid = data["c"] if data["c"] else data["i"]
         direction,offset = DIRECTION_OFFSET_BINGX2VT[(data["ps"], data["S"])]
+
         order: OrderData = OrderData(
-            orderid=order_id,
-            symbol=data["s"],
+            orderid=orderid,
+            symbol=symbol,
             exchange=Exchange.BINGXS,
             price=float(data["p"]),
             volume=float(data["q"]),
@@ -1050,6 +1019,7 @@ class BingxsWebsocketApi(WebsocketClient):
             datetime=get_local_datetime(packet["E"]),
             gateway_name=self.gateway_name,
         )
+
         self.gateway.on_order(order)
 
         if order.traded:
